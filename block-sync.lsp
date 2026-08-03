@@ -6,6 +6,9 @@
 (defun safe-command (&rest args)
 	(apply 'command args))
 
+(defun cancel-active-command ()
+	(vl-catch-all-apply 'vl-cmdf (list "._ESC")))
+
 (defun ensure-trailing-backslash (p)
 	(if (= (substr p (strlen p) 1) "\\") p (strcat p "\\")))
 
@@ -46,83 +49,92 @@
 			(reverse names))
 		'()))
 
-(defun export-blocks-to-folder (names folder / fname)
+(defun export-blocks-to-folder (names folder / fname old-cmdecho old-filedia old-regenmode)
 	(if (null names) (progn (princ "\nNo blocks to export.") nil)
 		(progn
-			(setq old-cmdecho (getvar "CMDECHO"))
+			(setq old-cmdecho (getvar "CMDECHO")
+					old-filedia (getvar "FILEDIA")
+					old-regenmode (getvar "REGENMODE"))
 			(setvar "CMDECHO" 0)
+			(setvar "FILEDIA" 0)
+			(setvar "REGENMODE" 0)
 			(foreach nm names
 				(setq fname (strcat folder nm ".dwg"))
 				(princ (strcat "\nExporting block: " nm " -> " fname))
 				(command "._-WBLOCK" (strcat "\"" fname "\"") "B" nm "")
 				)
 			(setvar "CMDECHO" old-cmdecho)
+			(setvar "FILEDIA" old-filedia)
+			(setvar "REGENMODE" old-regenmode)
 			(princ (strcat "\nExported " (itoa (length names)) " blocks.")))))
 
-(defun import-dwgs-from-folder (folder / files fullpath blkName fullSpec before after res action insertPt insertPtStr missingBlocks)
+(defun import-dwgs-from-folder (folder / files fullpath blkName fullSpec before after res action existingBlocks missingBlocks f old-cmdecho old-filedia old-regenmode)
 	(if (not (vl-file-directory-p folder)) (progn (princ "\nFolder not found.") nil)
 		(progn
 			(setq files (vl-directory-files folder "*.dwg" 1))
 			(if (null files) (princ "\nNo .dwg files found in folder.")
 				(progn
-					(setq old-cmdecho (getvar "CMDECHO"))
+					(setq old-cmdecho (getvar "CMDECHO")
+							old-filedia (getvar "FILEDIA")
+							old-regenmode (getvar "REGENMODE"))
 					(setvar "CMDECHO" 0)
-					(setq missingBlocks '())
+					(setvar "FILEDIA" 0)
+					(setvar "REGENMODE" 0)
+					(setq existingBlocks '()
+							missingBlocks '())
 					(foreach f files
 						(setq fullpath (strcat folder f)
 								blkName (vl-filename-base fullpath))
-						(if (not (tblsearch "BLOCK" blkName))
+						(if (tblsearch "BLOCK" blkName)
+							(setq existingBlocks (cons blkName existingBlocks))
 							(setq missingBlocks (cons blkName missingBlocks))))
-					(setq missingBlocks (reverse missingBlocks))
+					(setq existingBlocks (reverse existingBlocks)
+							missingBlocks (reverse missingBlocks))
 					(if missingBlocks
 						(progn
-							(initget "Skip Insert")
-							(setq action (getkword "\nMissing blocks found. [Skip/Insert] all missing blocks: "))
-							(if (or (equal action "Insert" 1) (equal action "I" 1))
-								(setq insertPt (getpoint "\nSpecify insertion point for all missing blocks: ")))))
-					(foreach f files
-						(setq fullpath (strcat folder f)
-								blkName (vl-filename-base fullpath)
+							(initget "Skip Import")
+							(setq action (getkword "\nNew block definitions found in the folder specified. [Skip/Import] all new block definitions?: "))))
+					(foreach blkName existingBlocks
+						(setq fullpath (strcat folder blkName ".dwg")
 								fullSpec (strcat blkName "=" fullpath))
-						(princ (strcat "\nImporting: " blkName " <- " fullpath))
+						(princ (strcat "\nRedefining block: " blkName " <- " fullpath))
 						(setq before (entlast))
-						(if (tblsearch "BLOCK" blkName)
+						(setq res
+							(vl-catch-all-apply
+								'vl-cmdf
+								(list "_.-INSERT" fullSpec "0,0" "1" "1" "0")))
+						(if (vl-catch-all-error-p res)
+							(princ (strcat "\nRedefine failed for: " fullpath))
 							(progn
+								(setq after (entlast))
+								(if (and after (not (eq after before))) (entdel after))
+								(cancel-active-command)
+								(princ (strcat "\nRedefined block: " blkName)))))
+					(foreach blkName missingBlocks
+						(setq fullpath (strcat folder blkName ".dwg")
+								fullSpec (strcat blkName "=" fullpath))
+						(princ (strcat "\nImporting new block: " blkName " <- " fullpath))
+						(setq before (entlast))
+						(cond
+							((or (equal action "Skip" 1) (equal action "S" 1))
+								(princ "\nSkipped."))
+							((or (equal action "Import" 1) (equal action "I" 1))
 								(setq res
 									(vl-catch-all-apply
 										'vl-cmdf
-										(list "_.-INSERT" fullSpec "y" "0,0" "1" "0" "0")))
-								(vl-catch-all-apply 'vl-cmdf (list "._CANCEL"))
+										(list "_.-INSERT" fullSpec "0,0" "1" "1" "0")))
 								(if (vl-catch-all-error-p res)
 									(princ (strcat "\nImport failed for: " fullpath))
 									(progn
 										(setq after (entlast))
-										(if (and after (not (eq after before))) (entdel after)))))
-							(progn
-								(cond
-									((or (equal action "Skip" 1) (equal action "S" 1))
-										(princ "\nSkipped."))
-									((or (equal action "Insert" 1) (equal action "I" 1))
-										(setq res
-											(vl-catch-all-apply
-												'vl-cmdf
-												(list "_.-INSERT" fullSpec insertPt "1" "1" "0")))
-										(if (vl-catch-all-error-p res)
-											(princ (strcat "\nInsert failed for: " fullpath))
-											(princ (strcat "\nInserted block: " blkName))))
-									(T (princ "\nUnknown option. Skipping block.")))))
-						)
+										(if (and after (not (eq after before))) (entdel after))
+										(cancel-active-command)
+										(princ (strcat "\nImported block: " blkName)))))
+							(T (princ "\nUnknown option. Skipping block."))))
 					(setvar "CMDECHO" old-cmdecho)
 					(princ (strcat "\nImported " (itoa (length files)) " files."))
 					)))))
 
-(defun delete-folder-and-contents (folder / fso)
-	(if (not (vl-file-directory-p folder)) (princ "\nFolder not found; nothing deleted.")
-		(progn
-			(setq fso (vlax-create-object "Scripting.FileSystemObject"))
-			(vlax-invoke-method fso 'DeleteFolder folder)
-			(vlax-release-object fso)
-			(princ "\nFolder deleted."))))
 
 (defun c:blocksync (/ choice)
 	(initget "Export Import")
@@ -159,12 +171,7 @@
 		 (if (null folder)
 			 (princ "\nNo folder provided. Aborting.")
 			 (progn
-				 (import-dwgs-from-folder folder)
-				 (initget "Yes No")
-				 (setq ans (getkword "\nDelete the source folder and its contents? [Yes/No]: "))
-				 (if (and ans (or (equal ans "Yes" 1) (equal ans "Y" 1)))
-					 (delete-folder-and-contents folder)
-					 (princ "\nFolder preserved.")))))
+				 (import-dwgs-from-folder folder))))
 
 		(T (princ "\nUnknown option. Use Export or Import.")))
 	(princ))
